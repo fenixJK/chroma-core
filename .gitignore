@@ -1,0 +1,38 @@
+# Visual Studio
+.vs/
+*.VC.db
+*.VC.opendb
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# MSVC build outputs
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Oo]bj/
+[Bb]in/
+
+# C/C++ intermediates and binaries
+*.obj
+*.iobj
+*.ipdb
+*.idb
+*.ilk
+*.pch
+*.pdb
+*.exp
+*.lib
+*.dll
+*.exe
+*.recipe
+*.tlog
+*.lastbuildstate
+
+# Logs
+*.log
+
+# Nested project output root
+artifacts/
