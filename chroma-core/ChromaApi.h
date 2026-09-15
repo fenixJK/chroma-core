@@ -68,6 +68,12 @@ struct ChromaDebugImageV1 {
     int32_t bytesRequired;
     int32_t bytesWritten;
 };
+enum ChromaContextMode : int32_t {
+    CHROMA_CONTEXT_NONE = 0,
+    CHROMA_CONTEXT_RING = 1,
+    CHROMA_CONTEXT_BLOOM = 2
+};
+
 enum ChromaStatusCode : int32_t {
     CHROMA_STATUS_OK = 0,
     CHROMA_STATUS_INVALID_ARGUMENT = 1,

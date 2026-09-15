@@ -173,6 +173,7 @@ struct ColorPatternConfig {
     ShapeFilterConfig shape;
     ContextRingConfig context;
     DebugDrawConfig debug;
+    bool matchBlooms = false;
 };
 
 struct DetectionMetrics {
@@ -421,7 +422,7 @@ public:
         return Find(scene);
     }
 
-    ColorPatternRunResult Find(const cv::Mat& sceneBgr) const {
+    ColorPatternRunResult Find(const cv::Mat& sceneBgr, bool buildDebug = true) const {
         if (sceneBgr.empty()) {
             throw std::invalid_argument("Find received empty scene image.");
         }
@@ -431,6 +432,7 @@ public:
         cv::cvtColor(scene, hsv, cv::COLOR_BGR2HSV);
 
         cv::Mat centerMask = detail::BuildMask(hsv, config_.centerColor);
+        const cv::Mat rawCenterMask = config_.matchBlooms ? centerMask.clone() : cv::Mat();
         detail::ApplyMorphology(centerMask, config_.centerMorph);
 
         cv::Mat supportMask;
@@ -438,10 +440,15 @@ public:
         if (config_.context.enabled) {
             supportMask = detail::BuildMask(hsv, config_.context.supportColor);
             if (!config_.context.excludeHues.Empty()) {
+                auto excludeSatRange = config_.context.excludeSatRange;
+                if (config_.matchBlooms) {
+                    excludeSatRange.minValue = std::max(30, excludeSatRange.minValue);
+                    excludeSatRange.maxValue = std::max(30, excludeSatRange.maxValue);
+                }
                 excludeMask = detail::BuildExcludeMask(
                     hsv,
                     config_.context.excludeHues,
-                    config_.context.excludeSatRange,
+                    excludeSatRange,
                     config_.context.excludeValRange);
             }
         }
@@ -449,15 +456,30 @@ public:
         std::vector<std::vector<cv::Point>> contours;
         cv::findContours(centerMask.clone(), contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
+        std::vector<std::pair<cv::Point2f, float>> nearbyCenters;
+        if (config_.matchBlooms) {
+            for (const auto& contour : contours) {
+                const float area = static_cast<float>(cv::contourArea(contour));
+                if (area < 4 || detail::ComputeCircularity(contour) < 0.5F)
+                    continue;
+                cv::Point2f center;
+                float radius;
+                cv::minEnclosingCircle(contour, center, radius);
+                nearbyCenters.emplace_back(center, area);
+            }
+        }
+
         ColorPatternRunResult result;
         result.rawCandidateCount = static_cast<int>(contours.size());
         result.sceneMaskCoverage = detail::SafeDiv(
             static_cast<float>(cv::countNonZero(centerMask)),
             static_cast<float>(centerMask.rows * centerMask.cols));
 
-        cv::Mat overlay = scene.clone();
-        cv::Mat maskDebug;
-        cv::cvtColor(centerMask, maskDebug, cv::COLOR_GRAY2BGR);
+        cv::Mat overlay, maskDebug;
+        if (buildDebug) {
+            overlay = scene.clone();
+            cv::cvtColor(centerMask, maskDebug, cv::COLOR_GRAY2BGR);
+        }
 
         for (const std::vector<cv::Point>& contour : contours) {
             const float area = static_cast<float>(cv::contourArea(contour));
@@ -476,32 +498,99 @@ public:
             m.circularity = detail::Clamp01(detail::ComputeCircularity(contour));
             m.passesArea = (area >= static_cast<float>(config_.shape.minArea) && area <= static_cast<float>(config_.shape.maxArea));
             m.passesCircularity = (m.circularity >= config_.shape.minCircularity);
+            if (config_.matchBlooms && m.passesArea) {
+                std::vector<std::pair<float, float>> neighbors;
+                const float maxDistance = std::max(80.0F, radius * 10.0F);
+                for (const auto& other : nearbyCenters) {
+                    const cv::Point2f delta = other.first - centerFloat;
+                    const float distance = delta.dot(delta);
+                    if (distance > radius * radius * 6.25F && distance <= maxDistance * maxDistance)
+                        neighbors.emplace_back(distance, other.second);
+                }
+                if (neighbors.size() >= 5) {
+                    const size_t count = std::min<size_t>(9, neighbors.size());
+                    std::partial_sort(neighbors.begin(), neighbors.begin() + count, neighbors.end());
+                    std::vector<float> areas;
+                    for (size_t i = 0; i < count; ++i)
+                        areas.push_back(neighbors[i].second);
+                    std::sort(areas.begin(), areas.end());
+                    m.passesArea = area >= areas[count / 2] * 6.0F;
+                }
+            }
 
             const float circleArea = std::max(1.0F, static_cast<float>(CV_PI) * radius * radius);
             m.centerFillRatio = detail::Clamp01(detail::SafeDiv(area, circleArea));
             m.passesCenterFill = (m.centerFillRatio >= config_.shape.minFillRatio);
+            if (config_.matchBlooms && m.passesCenterFill) {
+                const int halfSize = std::max(1, static_cast<int>(radius * 0.2F));
+                const cv::Rect middle = cv::Rect(center.x - halfSize, center.y - halfSize, halfSize * 2 + 1, halfSize * 2 + 1)
+                    & cv::Rect(0, 0, centerMask.cols, centerMask.rows);
+                m.passesCenterFill = cv::countNonZero(rawCenterMask(middle)) >= middle.area() * 0.8F;
+            }
+
+            cv::Scalar centerMean;
+            if (config_.matchBlooms && m.passesArea && m.passesCircularity && m.passesCenterFill) {
+                cv::Mat interior = cv::Mat::zeros(box.size(), CV_8U);
+                std::vector<std::vector<cv::Point>> localContours{ contour };
+                for (auto& point : localContours[0])
+                    point -= box.tl();
+                cv::drawContours(interior, localContours, 0, cv::Scalar(255), cv::FILLED);
+                cv::erode(interior, interior, cv::Mat(), cv::Point(-1, -1), std::max(2, static_cast<int>(radius * 0.25F)));
+                cv::bitwise_and(interior, rawCenterMask(box), interior);
+                cv::Scalar deviation;
+                cv::meanStdDev(hsv(box), centerMean, deviation, interior);
+                m.passesCenterFill = cv::countNonZero(interior) > 0
+                    && deviation[1] <= 25.0 && deviation[2] <= std::max(12.0, centerMean[2] * 0.2);
+            }
 
             if (config_.context.enabled) {
-                cv::Mat ringMask = cv::Mat::zeros(centerMask.size(), CV_8U);
                 const int inner = std::max(1, static_cast<int>(std::lround(radius * (static_cast<float>(config_.context.innerRadiusPercent) / 100.0F))));
                 const int outer = std::max(inner + 1, static_cast<int>(std::lround(radius * (static_cast<float>(config_.context.outerRadiusPercent) / 100.0F))));
-
-                cv::circle(ringMask, center, outer, cv::Scalar(255), cv::FILLED);
-                cv::circle(ringMask, center, inner, cv::Scalar(0), cv::FILLED);
-
-                cv::Mat validRingMask = ringMask.clone();
-                if (!excludeMask.empty()) {
-                    cv::Mat excludedInRing;
-                    cv::bitwise_and(ringMask, excludeMask, excludedInRing);
-                    cv::bitwise_xor(validRingMask, excludedInRing, validRingMask);
-                }
+                const cv::Rect roi = cv::Rect(center.x - outer, center.y - outer, outer * 2 + 1, outer * 2 + 1)
+                    & cv::Rect(0, 0, centerMask.cols, centerMask.rows);
+                cv::Mat ringMask = cv::Mat::zeros(roi.size(), CV_8U);
+                const cv::Point localCenter = center - roi.tl();
+                cv::circle(ringMask, localCenter, outer, cv::Scalar(255), cv::FILLED);
+                cv::circle(ringMask, localCenter, inner, cv::Scalar(0), cv::FILLED);
 
                 cv::Mat supportInRing;
-                cv::bitwise_and(supportMask, validRingMask, supportInRing);
+                cv::bitwise_and(supportMask(roi), ringMask, supportInRing);
+                if (!excludeMask.empty())
+                    supportInRing.setTo(0, excludeMask(roi));
 
-                const float validPx = static_cast<float>(cv::countNonZero(validRingMask));
+                bool extendSupport = false;
+                if (config_.matchBlooms && m.passesArea && m.passesCircularity && m.passesCenterFill) {
+                    std::vector<cv::Point> hull, corners;
+                    cv::convexHull(contour, hull);
+                    cv::approxPolyDP(hull, corners, cv::arcLength(hull, true) * 0.04, true);
+                    extendSupport = corners.size() >= 5 && area >= cv::contourArea(hull) * 0.93;
+                }
+                if (extendSupport) {
+                    for (int y = 0; y < roi.height; ++y) {
+                        const auto* pixels = hsv.ptr<cv::Vec3b>(roi.y + y) + roi.x;
+                        const auto* ring = ringMask.ptr<unsigned char>(y);
+                        auto* support = supportInRing.ptr<unsigned char>(y);
+                        for (int x = 0; x < roi.width; ++x) {
+                            if (!ring[x] || support[x])
+                                continue;
+                            const auto& pixel = pixels[x];
+                            if (pixel[2] < centerMean[2] * 0.3
+                                || (pixel[0] >= 40 && pixel[0] <= 80
+                                    && pixel[1] >= std::max(150.0, centerMean[1] + 40.0)
+                                    && pixel[2] >= centerMean[2] * 0.7))
+                                support[x] = 255;
+                        }
+                    }
+                }
+
+                float ringPx = static_cast<float>(cv::countNonZero(ringMask));
+                if (!config_.matchBlooms && !excludeMask.empty()) {
+                    cv::Mat excludedInRing;
+                    cv::bitwise_and(excludeMask(roi), ringMask, excludedInRing);
+                    ringPx -= cv::countNonZero(excludedInRing);
+                }
                 const float supportPx = static_cast<float>(cv::countNonZero(supportInRing));
-                m.ringSupportRatio = detail::Clamp01(detail::SafeDiv(supportPx, validPx));
+                m.ringSupportRatio = detail::Clamp01(detail::SafeDiv(supportPx, ringPx));
                 m.passesContext = (m.ringSupportRatio >= config_.context.minSupportRatio);
             } else {
                 m.ringSupportRatio = 1.0F;
@@ -542,7 +631,7 @@ public:
                 result.score = std::max(result.score, det.metrics.score);
             }
 
-            if (det.metrics.accepted || config_.debug.drawRejected) {
+            if (buildDebug && (det.metrics.accepted || config_.debug.drawRejected)) {
                 const cv::Scalar stroke = det.metrics.accepted ? config_.debug.acceptedColor : config_.debug.rejectedColor;
                 cv::rectangle(overlay, det.boxPx, stroke, 2, cv::LINE_AA);
                 cv::circle(overlay, det.centerPx, std::max(2, static_cast<int>(std::lround(det.radiusPx))), stroke, 1, cv::LINE_AA);
@@ -560,7 +649,8 @@ public:
         result.acceptedRatio = detail::SafeDiv(static_cast<float>(result.acceptedCount), static_cast<float>(std::max(1, result.rawCandidateCount)));
         result.debugOverlay = overlay;
         result.debugMask = maskDebug;
-        result.sideBySideDebug = detail::BuildSideBySide(result.debugOverlay, result.debugMask);
+        if (buildDebug)
+            result.sideBySideDebug = detail::BuildSideBySide(result.debugOverlay, result.debugMask);
         return result;
     }
 

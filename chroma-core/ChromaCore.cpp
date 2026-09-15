@@ -167,6 +167,11 @@ int32_t ConvertApiConfigToPattern(
         return CHROMA_STATUS_CONFIG_ERROR;
     }
 
+    if (in.requireContextRing < CHROMA_CONTEXT_NONE || in.requireContextRing > CHROMA_CONTEXT_BLOOM) {
+        errorOut = "Unknown context mode.";
+        return CHROMA_STATUS_CONFIG_ERROR;
+    }
+
     vision::ColorPatternConfig cfg{};
     cfg.centerColor.hues.Clear();
     for (int32_t i = 0; i < in.centerHueRangeCount; ++i) {
@@ -190,6 +195,7 @@ int32_t ConvertApiConfigToPattern(
     cfg.shape.minFillRatio = in.minCenterFillRatio;
 
     cfg.context.enabled = (in.requireContextRing != 0);
+    cfg.matchBlooms = (in.requireContextRing == CHROMA_CONTEXT_BLOOM);
     cfg.context.innerRadiusPercent = in.ringInnerRadiusPercent;
     cfg.context.outerRadiusPercent = in.ringOuterRadiusPercent;
     cfg.context.supportColor.hues = vision::HueRangeSet({ {0, 179} });
@@ -252,7 +258,7 @@ ChromaConfigV1 ConvertPatternToApiConfig(const vision::ColorPatternConfig& in) {
     out.minCircularity = in.shape.minCircularity;
     out.minCenterFillRatio = in.shape.minFillRatio;
 
-    out.requireContextRing = in.context.enabled ? 1 : 0;
+    out.requireContextRing = in.matchBlooms ? CHROMA_CONTEXT_BLOOM : (in.context.enabled ? CHROMA_CONTEXT_RING : CHROMA_CONTEXT_NONE);
     out.ringInnerRadiusPercent = in.context.innerRadiusPercent;
     out.ringOuterRadiusPercent = in.context.outerRadiusPercent;
 
@@ -296,7 +302,8 @@ int32_t DetectRunResultFromMat(
     const vision::ColorPatternConfig& cfg,
     vision::ColorPatternRunResult& outResult,
     wchar_t* outError,
-    const int32_t outErrorChars) {
+    const int32_t outErrorChars,
+    const bool buildDebug = true) {
     outResult = {};
     WriteErrorMessage(outError, outErrorChars, L"");
 
@@ -307,7 +314,7 @@ int32_t DetectRunResultFromMat(
 
     try {
         const vision::ColorPatternFinder finder(cfg);
-        outResult = finder.Find(sceneBgrOrBgra);
+        outResult = finder.Find(sceneBgrOrBgra, buildDebug);
         return CHROMA_STATUS_OK;
     }
     catch (const std::exception& ex) {
@@ -330,7 +337,7 @@ int32_t DetectAcceptedCentersFromMat(
     outCenters.clear();
 
     vision::ColorPatternRunResult result;
-    const int32_t status = DetectRunResultFromMat(sceneBgrOrBgra, cfg, result, outError, outErrorChars);
+    const int32_t status = DetectRunResultFromMat(sceneBgrOrBgra, cfg, result, outError, outErrorChars, false);
     if (status != CHROMA_STATUS_OK) {
         return status;
     }
@@ -556,7 +563,7 @@ int32_t LocateBitmapImpl(
 } // namespace
 
 int32_t CHROMA_CALL ChromaRuntime_GetApiVersion() {
-    return 1;
+    return 2;
 }
 
 int32_t CHROMA_CALL ChromaRuntime_GetConfigStructSize() {
