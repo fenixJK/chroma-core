@@ -498,6 +498,8 @@ public:
             m.circularity = detail::Clamp01(detail::ComputeCircularity(contour));
             m.passesArea = (area >= static_cast<float>(config_.shape.minArea) && area <= static_cast<float>(config_.shape.maxArea));
             m.passesCircularity = (m.circularity >= config_.shape.minCircularity);
+            if (config_.matchBlooms)
+                m.passesCircularity = m.passesCircularity && box.height <= box.width * 1.25F;
             if (config_.matchBlooms && m.passesArea) {
                 std::vector<std::pair<float, float>> neighbors;
                 const float maxDistance = std::max(80.0F, radius * 10.0F);
