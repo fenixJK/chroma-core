@@ -589,7 +589,8 @@ public:
                         centerMean[2] * (refined ? 0.08 : roundCenter ? 0.06 : 0.2));
             }
 
-            if (config_.context.enabled) {
+            if (config_.context.enabled && (buildDebug || !config_.matchBlooms
+                || (m.passesArea && m.passesCircularity && m.passesCenterFill))) {
                 const float contextRadius = radius + (refined ? 1.0F : 0.0F);
                 const int inner = std::max(1, static_cast<int>(std::lround(contextRadius * (static_cast<float>(config_.context.innerRadiusPercent) / 100.0F))));
                 const int outer = std::max(inner + 1, static_cast<int>(std::lround(contextRadius * (static_cast<float>(config_.context.outerRadiusPercent) / 100.0F))));
@@ -643,8 +644,8 @@ public:
                 m.ringSupportRatio = detail::Clamp01(detail::SafeDiv(supportPx, ringPx));
                 m.passesContext = (m.ringSupportRatio >= config_.context.minSupportRatio);
             } else {
-                m.ringSupportRatio = 1.0F;
-                m.passesContext = true;
+                m.ringSupportRatio = config_.context.enabled ? 0.0F : 1.0F;
+                m.passesContext = !config_.context.enabled;
             }
 
             const float shapeScore = (m.circularity * 0.55F) + (m.centerFillRatio * 0.45F);
